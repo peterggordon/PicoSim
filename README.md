@@ -8,13 +8,19 @@ no longer supported following Picosun's acquisition by ASM.
 ## Background
 
 This software was developed by reverse-engineering the PLC communication 
-protocol of a Picosun R200 ALD tool. Picosun as an independent company 
-no longer exists — their product line was absorbed by ASM. As a result, 
-these tools receive no software support. PicoSim exists to fill that gap.
+protocol of a Picosun R200 ALD tool at the Carleton University Nanofab 
+Facility. Picosun as an independent company no longer exists — their 
+product line was absorbed by ASM. As a result, these tools receive no 
+software support. PicoSim was created to fill that gap.
+
+Tools used to create this software include: ChatGPT & Claude for coding,
+Wireshark for capturing traffic between Picosun's HMI and the PLC, and
+CX-One for reading the PLC code. Without those tools, this project would
+never have happened. 
 
 ## Important Disclaimers
 
-- This software has only been tested on a single Picosun R200 tool. 
+- This software has so far only been tested on a single Picosun R200 tool. 
   Behavior on other tools (R150, R200 Advanced, etc.) is unknown.
 - This is not commercial software. It is not to be sold or used for 
   commercial gain.
@@ -74,4 +80,5 @@ is contrary to the spirit of this project.
 
 Pull requests are welcome. If you have successfully adapted PicoSim 
 for a different tool, please consider contributing your configuration 
-back to the repository.
+back to the repository. If you want to contact me directly, please
+use peter.gordon@carleton.ca. 
