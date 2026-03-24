@@ -3,20 +3,23 @@
 A Python-based desktop operator interface for Picosun ALD tools, 
 communicating directly with the Omron PLC over FINS/UDP. Developed 
 as a community replacement for the original HMI software, which is 
-no longer supported following Picosun's acquisition by ASM.
+no longer supported following Picosun's acquisition by ASM. As 
+ever, this project was built on the shoulders of giants. 
 
 ## Background
 
 This software was developed by reverse-engineering the PLC communication 
 protocol of a Picosun R200 ALD tool at the Carleton University Nanofab 
-Facility. Picosun as an independent company no longer exists — their 
-product line was absorbed by ASM. As a result, these tools receive no 
-software support. PicoSim was created to fill that gap.
+Facility. Picosun as an independent company ceased to exist when their 
+product line was absorbed by ASM. As a result, older tools no longer
+receive support. PicoSim was created to fill that gap.
 
-Tools used to create this software include: ChatGPT & Claude for coding,
+The tools used to create this software include: ChatGPT & Claude for coding,
 Wireshark for capturing traffic between Picosun's HMI and the PLC, and
 CX-One for reading the PLC code. Without those tools, this project would
-never have happened. 
+never have happened. Bear in mind that this software was largely "vibe-coded"
+by someone whose main experience in programming was an undergrad 
+Fortran 77 class in 1994. 
 
 ## Important Disclaimers
 
@@ -48,7 +51,7 @@ to vendor support. You are encouraged to:
 - Dependencies: see requirements.txt
 
 ### Installation
-```
+```bash
 pip install -r requirements.txt
 python main.py
 ```
