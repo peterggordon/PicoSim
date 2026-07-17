@@ -25,7 +25,7 @@ from itertools import cycle
 
 
 # GUI version (shown in the window title)
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 MAX_HEAT_NOTE_MSG = (
     "Note: Maximum heating setpoint is not high enough.  "
@@ -158,8 +158,7 @@ class PicoSimApp(tk.Tk):
         self._vent_active = False
         self._evac_active = False
 
-        # seconds of history to show in the trend plots (controls x-axis range)
-        self.trend_window_car = tk.IntVar(value=TREND_WINDOW_SECONDS) 
+
 
         # Cache of selected CIO words we read explicitly for state inference (e.g., lid/valve command bits)
         self.cio_cache = {}
@@ -183,8 +182,6 @@ class PicoSimApp(tk.Tk):
         self.tabs.add(self.network_tab, text="Network")
         self.tabs.add(self.trends_tab, text="Manual")
         self.tabs.add(self.recipe_tab, text="Recipe")
-
-        self.trend_window_var = tk.IntVar(value=TREND_WINDOW_SECONDS)  
 
         self._build_network_tab()
         self._build_trends_tab()
@@ -214,8 +211,6 @@ class PicoSimApp(tk.Tk):
 
         # --- Background polling thread ---
         self.running = True
-        self.run_state = None
-        self.run_abort_flag = False
         self.poll_thread = threading.Thread(target=self._poll_loop, daemon=True)
         self.poll_thread.start()
 
@@ -727,62 +722,28 @@ class PicoSimApp(tk.Tk):
     # ----------------------------
 
     def _build_network_tab(self):
-            self.network_status = ttk.Label(
-                self.network_tab,
-                text="Status: OFFLINE",
-                foreground="red",
-                font=("Arial", 14),
-            )
-            self.network_status.pack(pady=20)
+        self.network_status = ttk.Label(
+            self.network_tab,
+            text="Status: OFFLINE",
+            foreground="red",
+            font=("Arial", 14),
+        )
+        self.network_status.pack(pady=20)
 
-            # IP entry row
-            ip_frame = ttk.Frame(self.network_tab)
-            ip_frame.pack(pady=(0, 10))
+        self.connect_btn = ttk.Button(
+            self.network_tab,
+            text="Connect to Tool",
+            command=self._connect_to_tool,
+        )
+        self.connect_btn.pack()
 
-            ttk.Label(ip_frame, text="Tool IP:").grid(row=0, column=0, padx=(0, 6), sticky="w")
-            self.plc_ip_var = tk.StringVar(value=self.fins.plc_ip if self.fins else "192.168.1.3")
-            ttk.Entry(ip_frame, textvariable=self.plc_ip_var, width=16).grid(row=0, column=1)
-
-            ttk.Label(ip_frame, text="Local IP:").grid(row=1, column=0, padx=(0, 6), pady=(6,0), sticky="w")
-            self.local_ip_var = tk.StringVar(value=self.fins.local_ip if self.fins else "192.168.1.2")
-            ttk.Entry(ip_frame, textvariable=self.local_ip_var, width=16).grid(row=1, column=1, pady=(6,0))
-
-            self.connect_btn = ttk.Button(
-                self.network_tab,
-                text="Connect to Tool",
-                command=self._connect_to_tool,
-            )
-            self.connect_btn.pack()
-
-    
-    # ----------------------------
-    # Connect to tool handler (Network tab)
-    # ----------------------------
+        self.ip_label = ttk.Label(self.network_tab, text=f"Tool IP: {self.ip_address}", font=("Arial", 12))
+        self.ip_label.pack(pady=10)
 
     def _connect_to_tool(self):
-        plc_ip = self.plc_ip_var.get().strip()
-        local_ip = self.local_ip_var.get().strip()
-
-        if not plc_ip or not local_ip:
-            self.network_status.configure(text="Status: OFFLINE - Enter valid IPs", foreground="red")
+        if not self.fins:
+            self.network_status.configure(text="Status: OFFLINE - No FINS client", foreground="red")
             return
-
-        # Rebuild FINS client if IPs have changed or client is missing
-        if (
-            self.fins is None
-            or self.fins.plc_ip != plc_ip
-            or self.fins.local_ip != local_ip
-        ):
-            if self.fins:
-                try:
-                    self.fins.close()
-                except Exception:
-                    pass
-            try:
-                self.fins = FINSClient(local_ip=local_ip, plc_ip=plc_ip)
-            except Exception as e:
-                self.network_status.configure(text=f"Status: OFFLINE - {e}", foreground="red")
-                return
 
         response = self.fins.read_snapshot()
         if response:
@@ -893,16 +854,6 @@ class PicoSimApp(tk.Tk):
         add_y_range_row("Press (hPa)", self.press_ymin_var, self.press_ymax_var)
         add_y_range_row("Flow (sccm)", self.flow_ymin_var, self.flow_ymax_var)
 
-        # --- Time window control ---
-        row += 1
-        ttk.Label(live_frame, text="Time window (s)", ).grid(
-            row=row, column=0, sticky="w", pady=2
-        )
-        ttk.Entry(live_frame, textvariable=self.trend_window_var, width=6).grid(
-            row=row, column=1, sticky="w", pady=2
-        )
-        row += 1
-
         # --- Logger buttons (folder controls) ---
         row += 1
         ttk.Label(live_frame, text="Data Logging", font=("Arial", 11, "bold")).grid(
@@ -929,7 +880,7 @@ class PicoSimApp(tk.Tk):
 
         # Data buffers and Line2D objects
         self.trend_buffers = {
-            tag: {"t": deque(maxlen=600), "v": deque(maxlen=600)}
+            tag: {"t": deque(maxlen=TREND_WINDOW_SECONDS), "v": deque(maxlen=TREND_WINDOW_SECONDS)}
             for tag in TREND_ALL_TAGS
         }
 
@@ -1046,8 +997,6 @@ class PicoSimApp(tk.Tk):
 
         now = time.time()
 
-        window_s = max(10, self.trend_window_var.get()) # Minimum 10 seconds to avoid weirdness with very small windows. (added March 16, 2026)
-
         for tag in TREND_ALL_TAGS:
             line = self.trend_lines[tag]
             # Pressure traces use high-rate buffers; other traces use the 1 Hz buffers.
@@ -1059,14 +1008,14 @@ class PicoSimApp(tk.Tk):
                 x = [now - t for t in times]  # seconds ago
                 x_vals, y_vals = [], []
                 for xi, yi in zip(x, values):
-                    if 0.0 <= xi <= window_s:
+                    if 0.0 <= xi <= TREND_WINDOW_SECONDS:
                         x_vals.append(xi)
                         y_vals.append(yi)
                 line.set_data(x_vals, y_vals)
             else:
                 line.set_data([], [])
 
-        self.ax_temp.set_xlim(window_s, 0)
+        self.ax_temp.set_xlim(TREND_WINDOW_SECONDS, 0)
 
         if self.use_fixed_ranges.get():
             self.ax_temp.set_ylim(self.temp_ymin_var.get(), self.temp_ymax_var.get())
@@ -1090,7 +1039,7 @@ class PicoSimApp(tk.Tk):
         set_external_legend(self.ax_press, TREND_PRESS_TAGS)
         set_external_legend(self.ax_flow, TREND_FLOW_TAGS)
 
-        start_epoch = now - window_s
+        start_epoch = now - TREND_WINDOW_SECONDS
         start_str = datetime.fromtimestamp(start_epoch).strftime("%H:%M:%S")
         end_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
         self.trend_time_label.config(text=f"Window: {start_str} – {end_str} (seconds ago on axis)")
@@ -1575,6 +1524,8 @@ class PicoSimApp(tk.Tk):
             "TE211": tk.StringVar(value="140"),
             "post_TE2": tk.StringVar(value="20"),
             "post_TE2_tol": tk.StringVar(value="2.0"),
+            "post_TE210": tk.StringVar(value="20"),
+            "post_TE210_tol": tk.StringVar(value="2.0"),
             "MFC1": tk.StringVar(value="300"),
             "MFC100": tk.StringVar(value="40"),
             "MFC200": tk.StringVar(value="40"),
@@ -1592,6 +1543,8 @@ class PicoSimApp(tk.Tk):
             ("TE210 tol", "TE210_tol", "°C"),
             ("Post TE2", "post_TE2", "°C"),
             ("Post tol", "post_TE2_tol", "°C"),
+            ("Post TE210", "post_TE210", "°C"),
+            ("Post TE210 tol", "post_TE210_tol", "°C"),
             ("MFC1", "MFC1", "sccm"),
             ("MFC100", "MFC100", "sccm"),
             ("MFC200", "MFC200", "sccm"),
@@ -2367,6 +2320,14 @@ class PicoSimApp(tk.Tk):
         except Exception:
             pass
 
+        try:
+            post_c210 = float(recipe["setpoints"].get("post_TE210", recipe["setpoints"]["TE210"]))
+            post_raw210 = int(round(post_c210 * 10.0))
+            area210, addr210 = SETPOINT_COMMANDS["TE210"]
+            self.fins.write_word(addr210, post_raw210, area=area210)
+        except Exception:
+            pass
+
 
 
         # --- NEW: close out run state AFTER final popup update ---
@@ -2986,6 +2947,8 @@ class RecipeWizard(tk.Toplevel):
         self.sp_TE210_tol = row("TE210 tolerance", self.app.recipe_setpoint_vars["TE210_tol"].get())
         self.sp_post_TE2 = row("Post-deposition TE2", self.app.recipe_setpoint_vars["post_TE2"].get())
         self.sp_post_TE2_tol = row("Post-deposition tol", self.app.recipe_setpoint_vars["post_TE2_tol"].get())
+        self.sp_post_TE210 = row("Post-deposition TE210", self.app.recipe_setpoint_vars["post_TE210"].get())
+        self.sp_post_TE210_tol = row("Post-deposition TE210 tol", self.app.recipe_setpoint_vars["post_TE210_tol"].get())
 
         ttk.Separator(f, orient="horizontal").pack(fill="x", pady=10)
 
@@ -3147,6 +3110,8 @@ class RecipeWizard(tk.Toplevel):
                 "TE211": self.sp_TE211.get(),
                 "post_TE2": self.sp_post_TE2.get(),
                 "post_TE2_tol": self.sp_post_TE2_tol.get(),
+                "post_TE210": self.sp_post_TE210.get(),
+                "post_TE210_tol": self.sp_post_TE210_tol.get(),
                 "MFC1": self.sp_MFC1.get(),
                 "MFC100": self.sp_MFC100.get(),
                 "MFC200": self.sp_MFC200.get(),
@@ -3243,7 +3208,7 @@ class RecipeWizard(tk.Toplevel):
         lines.append(f"Delay (min): {sp.get('delay_min','0')}")
         lines.append("")
         lines.append("Setpoints:")
-        for k in ("TE1","TE2","TE2_tol","TE211","TE210","TE210_tol","post_TE2","post_TE2_tol","MFC1","MFC100","MFC200","MFC300","MFC400"):
+        for k in ("TE1","TE2","TE2_tol","TE211","TE210","TE210_tol","post_TE2","post_TE2_tol","post_TE210","post_TE210_tol","MFC1","MFC100","MFC200","MFC300","MFC400"):
             lines.append(f"  {k}: {sp.get(k,'')}")
         lines.append("")
         lines.append("Blocks:")
