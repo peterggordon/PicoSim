@@ -1,0 +1,13 @@
+# PyInstaller build output (the exe is distributed through GitHub Releases)
+build/
+dist/
+*.spec
+
+# Log files written by PicoSim
+*.txt
+*.csv
+!requirements.txt
+
+# Python cache
+__pycache__/
+*.pyc
