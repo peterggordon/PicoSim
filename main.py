@@ -25,7 +25,7 @@ from itertools import cycle
 
 
 # GUI version (shown in the window title)
-APP_VERSION = "1.0.4"
+APP_VERSION = "1.0.5"
 
 MAX_HEAT_NOTE_MSG = (
     "Note: Maximum heating setpoint is not high enough.  "
@@ -1308,14 +1308,15 @@ class PicoSimApp(tk.Tk):
         # Lid buttons depend on word 12 and PT1
         self._update_lid_buttons()
 
-    def _open_lid(self):
+    def _open_lid(self, attempt=1):
         if not self.online or not self.fins:
             return
 
         # Only permit opening at (near) atmosphere
         pt1 = float(self.snapshot_data.get("PT1", 0.0)) if getattr(self, "snapshot_data", None) else 0.0
         if pt1 < 950.0:
-            messagebox.showwarning("Cannot open lid", "PT1 must be > 950 hPa to open the lid.")
+            if attempt == 1:
+                messagebox.showwarning("Cannot open lid", "PT1 must be > 950 hPa to open the lid.")
             return
 
         # Step 1: release the close command first
@@ -1331,7 +1332,24 @@ class PicoSimApp(tk.Tk):
             self.cio_cache[12] = w12
             self._update_lid_buttons()
 
-            print(f"OPEN LID: release_close={'OK' if ok1 else 'FAILED'}, assert_open={'OK' if ok2 else 'FAILED'}")
+            print(f"OPEN LID (attempt {attempt}): release_close={'OK' if ok1 else 'FAILED'}, assert_open={'OK' if ok2 else 'FAILED'}")
+
+            # The first OPEN often does not take (the PLC appears to re-assert the
+            # close bit while the open bit is still 0). Read word 12 back and, if the
+            # close bit is still set, repeat the sequence once. Same as a second click.
+            if attempt == 1:
+                self.after(500, _verify_open)
+
+        def _verify_open():
+            w = self.fins.read_cio_words(LID_OPEN_CMD[0], 1) if self.fins else None
+            if not w:
+                print("OPEN LID: could not read back CIO12, not retrying")
+                return
+            self.cio_cache[12] = w[0]
+            if self._lid_is_open_inferred():
+                return
+            print(f"OPEN LID: not open after attempt 1 (CIO12=0x{w[0]:04X}), retrying")
+            self._open_lid(attempt=2)
 
         # Small dwell so PLC can see the close-release before the open command
         self.after(150, _assert_open)
