@@ -80,7 +80,8 @@ Features:
 - Recipe JSON: `title, created, line_names, setpoints (all strings), blocks[{cycles, steps[{variant, line, name, pulse_s, purge_s, sf_pulse_s, sf_hold_s}]}], total_time_s, summary`.
 
 **Network setup**
-- PC IP is hardcoded to 192.168.1.2 and PLC to 192.168.1.3:9600. FINS node numbers are the last octets. The PC must actually have that static IP or the socket bind fails and the app starts "OFFLINE". Making this configurable is a known TODO.
+- Defaults are PC 192.168.1.2 and PLC 192.168.1.3:9600. The Network tab has Tool IP / Local IP boxes; "Connect to Tool" rebuilds the `FINSClient` if either changed. The PC must actually have the Local IP or the socket bind fails and the app stays "OFFLINE".
+- FINS node numbers are still hardcoded in `FINSClient` (`pc_node = 2`, `plc_node = 3`), so IPs whose last octets differ from .2/.3 will likely not work yet.
 
 ## Running
 
@@ -129,4 +130,4 @@ Ordered roughly by how much they matter. None are fixed unless noted; fix only w
 
 ## Open items
 
-- Make PC/PLC IPs configurable.
+- Derive FINS node numbers from the entered IPs (IP entry boxes restored in v1.0.4, but nodes are still fixed at 2/3).

@@ -25,7 +25,7 @@ from itertools import cycle
 
 
 # GUI version (shown in the window title)
-APP_VERSION = "1.0.3"
+APP_VERSION = "1.0.4"
 
 MAX_HEAT_NOTE_MSG = (
     "Note: Maximum heating setpoint is not high enough.  "
@@ -182,6 +182,9 @@ class PicoSimApp(tk.Tk):
         self.tabs.add(self.network_tab, text="Network")
         self.tabs.add(self.trends_tab, text="Manual")
         self.tabs.add(self.recipe_tab, text="Recipe")
+
+        # seconds of history to show in the trend plots (controls x-axis range)
+        self.trend_window_var = tk.IntVar(value=TREND_WINDOW_SECONDS)
 
         self._build_network_tab()
         self._build_trends_tab()
@@ -730,6 +733,18 @@ class PicoSimApp(tk.Tk):
         )
         self.network_status.pack(pady=20)
 
+        # IP entry row
+        ip_frame = ttk.Frame(self.network_tab)
+        ip_frame.pack(pady=(0, 10))
+
+        ttk.Label(ip_frame, text="Tool IP:").grid(row=0, column=0, padx=(0, 6), sticky="w")
+        self.plc_ip_var = tk.StringVar(value=self.fins.plc_ip if self.fins else "192.168.1.3")
+        ttk.Entry(ip_frame, textvariable=self.plc_ip_var, width=16).grid(row=0, column=1)
+
+        ttk.Label(ip_frame, text="Local IP:").grid(row=1, column=0, padx=(0, 6), pady=(6,0), sticky="w")
+        self.local_ip_var = tk.StringVar(value=self.fins.local_ip if self.fins else "192.168.1.2")
+        ttk.Entry(ip_frame, textvariable=self.local_ip_var, width=16).grid(row=1, column=1, pady=(6,0))
+
         self.connect_btn = ttk.Button(
             self.network_tab,
             text="Connect to Tool",
@@ -737,13 +752,30 @@ class PicoSimApp(tk.Tk):
         )
         self.connect_btn.pack()
 
-        self.ip_label = ttk.Label(self.network_tab, text=f"Tool IP: {self.ip_address}", font=("Arial", 12))
-        self.ip_label.pack(pady=10)
-
     def _connect_to_tool(self):
-        if not self.fins:
-            self.network_status.configure(text="Status: OFFLINE - No FINS client", foreground="red")
+        plc_ip = self.plc_ip_var.get().strip()
+        local_ip = self.local_ip_var.get().strip()
+
+        if not plc_ip or not local_ip:
+            self.network_status.configure(text="Status: OFFLINE - Enter valid IPs", foreground="red")
             return
+
+        # Rebuild FINS client if IPs have changed or client is missing
+        if (
+            self.fins is None
+            or self.fins.plc_ip != plc_ip
+            or self.fins.local_ip != local_ip
+        ):
+            if self.fins:
+                try:
+                    self.fins.close()
+                except Exception:
+                    pass
+            try:
+                self.fins = FINSClient(local_ip=local_ip, plc_ip=plc_ip)
+            except Exception as e:
+                self.network_status.configure(text=f"Status: OFFLINE - {e}", foreground="red")
+                return
 
         response = self.fins.read_snapshot()
         if response:
@@ -854,6 +886,16 @@ class PicoSimApp(tk.Tk):
         add_y_range_row("Press (hPa)", self.press_ymin_var, self.press_ymax_var)
         add_y_range_row("Flow (sccm)", self.flow_ymin_var, self.flow_ymax_var)
 
+        # --- Time window control ---
+        row += 1
+        ttk.Label(live_frame, text="Time window (s)", ).grid(
+            row=row, column=0, sticky="w", pady=2
+        )
+        ttk.Entry(live_frame, textvariable=self.trend_window_var, width=6).grid(
+            row=row, column=1, sticky="w", pady=2
+        )
+        row += 1
+
         # --- Logger buttons (folder controls) ---
         row += 1
         ttk.Label(live_frame, text="Data Logging", font=("Arial", 11, "bold")).grid(
@@ -880,7 +922,7 @@ class PicoSimApp(tk.Tk):
 
         # Data buffers and Line2D objects
         self.trend_buffers = {
-            tag: {"t": deque(maxlen=TREND_WINDOW_SECONDS), "v": deque(maxlen=TREND_WINDOW_SECONDS)}
+            tag: {"t": deque(maxlen=600), "v": deque(maxlen=600)}
             for tag in TREND_ALL_TAGS
         }
 
@@ -997,6 +1039,13 @@ class PicoSimApp(tk.Tk):
 
         now = time.time()
 
+        # Minimum 10 seconds to avoid weirdness with very small windows.
+        # Falls back to the default if the box is blank or not a number (e.g. while typing).
+        try:
+            window_s = max(10, self.trend_window_var.get())
+        except tk.TclError:
+            window_s = TREND_WINDOW_SECONDS
+
         for tag in TREND_ALL_TAGS:
             line = self.trend_lines[tag]
             # Pressure traces use high-rate buffers; other traces use the 1 Hz buffers.
@@ -1008,14 +1057,14 @@ class PicoSimApp(tk.Tk):
                 x = [now - t for t in times]  # seconds ago
                 x_vals, y_vals = [], []
                 for xi, yi in zip(x, values):
-                    if 0.0 <= xi <= TREND_WINDOW_SECONDS:
+                    if 0.0 <= xi <= window_s:
                         x_vals.append(xi)
                         y_vals.append(yi)
                 line.set_data(x_vals, y_vals)
             else:
                 line.set_data([], [])
 
-        self.ax_temp.set_xlim(TREND_WINDOW_SECONDS, 0)
+        self.ax_temp.set_xlim(window_s, 0)
 
         if self.use_fixed_ranges.get():
             self.ax_temp.set_ylim(self.temp_ymin_var.get(), self.temp_ymax_var.get())
@@ -1039,7 +1088,7 @@ class PicoSimApp(tk.Tk):
         set_external_legend(self.ax_press, TREND_PRESS_TAGS)
         set_external_legend(self.ax_flow, TREND_FLOW_TAGS)
 
-        start_epoch = now - TREND_WINDOW_SECONDS
+        start_epoch = now - window_s
         start_str = datetime.fromtimestamp(start_epoch).strftime("%H:%M:%S")
         end_str = datetime.fromtimestamp(now).strftime("%H:%M:%S")
         self.trend_time_label.config(text=f"Window: {start_str} – {end_str} (seconds ago on axis)")
