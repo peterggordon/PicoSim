@@ -58,7 +58,7 @@ Features:
 2. apply_flows (MFC setpoints)
 3. pumpdown until PT1 < 90
 4. apply_temps
-5. wait_stable: PT1 < 15 and TE2/TE210 within tolerance
+5. wait_stable: PT1 < 20 and TE2/TE210 within tolerance (was < 15 before v1.0.5; the pump now only reaches 16-18 hPa)
 6. delay countdown (1 s ticks)
 7. sequencing: step_begin / step_wait through blocks and cycles
 8. finish: set post-deposition TE2 (TE210 post setpoint was added in v1.0.3; check `_finish_run_success`)
@@ -117,7 +117,7 @@ The maintainer is a self-described novice coder. So:
 Ordered roughly by how much they matter. None are fixed unless noted; fix only when asked.
 
 1. **PT1 safety during pulsing is effectively inactive.** `_run_tick` checks `phase in ("sequencing", "step_pulse", "step_purge", "step_sf")`, but the real phases are `step_begin` and `step_wait`. Only `sequencing` (one tick) matches, so a PT1 > 20 hPa excursion mid-recipe does not halt the run.
-2. **A second run never starts until the tool is hard-reset** (reported by the maintainer, cause unknown). After a run completes, PicoSim lets you start another run but the tool never executes it. A hard reset of the tool clears the condition. A hard reset clears non-retained PLC memory (CIO) while DM is kept, so the suspect is a CIO bit left set by the first run. Needs hardware observation and PLC docs.
+2. **Run stuck before the delay** (fixed in v1.0.5, pending hardware confirmation). Originally reported as "a second run never starts until the tool is hard-reset". Cause: `wait_stable` required PT1 < 15 hPa while the popup said < 20, and the pump now only reaches 16-18 hPa. The limit is now 20 hPa. Note that the pulsing safety limit (item 1) is also 20 hPa, so once item 1 is fixed there is little margin above base pressure.
 3. **Lid needs two OPEN clicks.** Likely cause: the PLC re-asserts the close bit (CIO12.08) while the open bit (CIO12.07) is 0, so releasing 12.08 before asserting 12.07 does not take on the first try. Workaround in v1.0.5: `_open_lid` reads CIO12 back after 500 ms and repeats the sequence once if the lid is not open. Not yet confirmed on hardware.
 4. **Aborting a queue leaves `_queue_run_list` populated.** `_abort_run` does not clear it, so the next "Run Current Recipe" is treated as part of the stale queue: filename prefix says QUEUE, and on completion `_finish_run_success` advances to the next stale queue entry. `_queue_run_list` is also never initialized in `__init__` (accessed via `getattr/hasattr`).
 5. **Stop-flow is unreachable from the wizard.** `stopflow_enabled` is never set True (`_page_stopflow_enable` is not in the page list), so the per-step hold times on the Stop Flow page are ignored. The runner and recipe format support stop-flow; only the wizard path is dead. `_start_over` also omits `per_step_sf`.

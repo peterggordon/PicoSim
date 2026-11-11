@@ -1998,7 +1998,7 @@ class PicoSimApp(tk.Tk):
         except Exception:
             sp = {}
 
-        # 1) Pressure gate (Delay doesn't begin until PT1<20; sequencing until PT1<15 is handled in code)
+        # 1) Pressure gate (Delay doesn't begin until PT1<20; same limit as the wait_stable check in _run_tick)
         if pt1 is None:
             pt_txt = "--"
         else:
@@ -2198,7 +2198,7 @@ class PicoSimApp(tk.Tk):
         if phase == "apply_temps":
             self._apply_temp_setpoints(recipe)
             self.run_state["phase"] = "wait_stable"
-            self.recipe_status.config(text="Waiting for temps within tolerance and PT1 < 15...")
+            self.recipe_status.config(text="Waiting for temps within tolerance and PT1 < 20...")
             self.after(500, self._run_tick)
             return
 
@@ -2209,7 +2209,7 @@ class PicoSimApp(tk.Tk):
             te2_ok = abs(te2 - float(sp["TE2"])) <= te2_tol
             te210_ok = abs(te210 - float(sp["TE210"])) <= te210_tol
 
-            if (pt1 < 15.0) and te2_ok and te210_ok:
+            if (pt1 < 20.0) and te2_ok and te210_ok:
                 # Begin stabilization delay countdown (if any)
                 self.run_state["phase"] = "delay"
                 self.run_state["delay_started"] = time.time()
