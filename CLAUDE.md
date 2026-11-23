@@ -9,7 +9,8 @@ PicoSim is an open-source Python/tkinter desktop operator interface for legacy P
 Features:
 - Network tab: connect to the PLC (one snapshot read decides ONLINE/OFFLINE).
 - Manual tab: setpoints, valve toggles, lid open/close, Vent and Evac buttons, live values, and a 60 s matplotlib trend view (temps, pressures, flows).
-- Recipe tab: a wizard builds recipes (blocks of steps with cycle counts, per-line pulse/purge, optional stop-flow), saved as JSON. Recipes run through a Tk-timer state machine, singly or as a queue.
+- Recipe tab: a wizard ("Create Recipe") builds recipes (blocks of steps with cycle counts, per-line pulse/purge, optional stop-flow), saved as JSON. Recipes run through a Tk-timer state machine, singly or as a queue.
+- Recipe editing (v1.1.0): the setpoint fields, block cycle counts and precursor names on the Recipe tab edit the current recipe in memory (marked "[Unsaved changes]" until Save Recipe). "Change Recipe" reopens the wizard prefilled from the current recipe, covering only lines, names, pulse/purge settings, blocks and stop flow. Run and Save validate the fields first (`_validate_recipe_edits`). A run uses a deep copy, so edits during a run do not affect it.
 - Run tab (v1.1.0): appears when a run starts and replaces the old progress popup and Run Monitor strip. Shows total time (delay + recipe), remaining time, queue totals, progress lines, delay clock and line LEDs. Removed on abort (with a "Run Aborted" message); stays after completion until Dismiss or a new run. A queue uses one tab. Times exclude pumpdown and warm-up.
 - Logging: 1 Hz text log (`DATA.txt`) always on once connected; a higher-rate CSV (`RUN_HIRES_*.csv` / `QUEUE_*.csv`) during recipe runs.
 
@@ -17,7 +18,7 @@ Features:
 
 | File | Role |
 |---|---|
-| `main.py` | Everything UI and control: `PicoSimApp` (tabs, polling thread, manual controls, vent/evac, recipe runner state machine) and `RecipeWizard` (Toplevel wizard). Also holds `SETPOINT_COMMANDS`, `VALVE_COMMANDS`, lid bit constants, trend tag lists. |
+| `main.py` | Everything UI and control: `PicoSimApp` (tabs, polling thread, manual controls, vent/evac, recipe runner state machine, Run tab) and `RecipeWizard` (Toplevel wizard; pages are addressed by key, `CREATE_PAGES` / `CHANGE_PAGES`). Also holds `SETPOINT_COMMANDS`, `VALVE_COMMANDS`, lid bit constants, trend tag lists, and the shared recipe helpers `compute_recipe_time_s`, `build_recipe_summary`, `validate_recipe_setpoints`. |
 | `network.py` | `FINSClient`: raw FINS/UDP over one socket. `read_snapshot()` (CIO110, 38 words), `read_words/read_word/read_cio_words`, `write_word(area=...)`, `write_bit()` (CIO bit area 0x30). A lock serializes all send/recv. Writes succeed only on FINS end code 0x0000. |
 | `data_parser.py` | `FIELD_MAP` (byte offset to label, unit, scale) and `parse_snapshot()`, which turns the 90-byte snapshot response into a dict of scaled numbers, or `{"error": ...}`. |
 | `data_logger.py` | `DataLogger` (daily `<Month DD YYYY> DATA.txt` in `~/PicoSimLogs`, plus Set Folder/Open Folder buttons) and `HighResPressureCapture` (threaded CSV writer; despite the name it logs all tags when given them). |
@@ -77,7 +78,7 @@ Features:
 - Log files are `*.txt` and `*.csv`, which are gitignored.
 
 **Compatibility**
-- Keep backward-compatibility fallbacks so old recipe JSON files load on new versions (use `.get()` with defaults for any new recipe field). The loader only requires `blocks` and `setpoints`.
+- Keep backward-compatibility fallbacks so old recipe JSON files load on new versions (use `.get()` with defaults for any new recipe field). The loader only requires `blocks` and `setpoints`. When a recipe is shown on the Recipe tab, `_populate_recipe_tree` fills missing setpoints in memory (`delay_min` = 0, `post_TE210` = TE210 as before, others from the field defaults).
 - Recipe JSON: `title, created, line_names, setpoints (all strings), blocks[{cycles, steps[{variant, line, name, pulse_s, purge_s, sf_pulse_s, sf_hold_s}]}], total_time_s, summary`.
 
 **Network setup**
@@ -121,15 +122,15 @@ Ordered roughly by how much they matter. None are fixed unless noted; fix only w
 2. **Run stuck before the delay** (fixed in v1.0.5, confirmed on hardware). Originally reported as "a second run never starts until the tool is hard-reset". Cause: `wait_stable` required PT1 < 15 hPa while the popup said < 20, and the pump now only reaches 16-18 hPa. The limit is now 20 hPa. Note that the pulsing safety limit (item 1) is also 20 hPa, so once item 1 is fixed there is little margin above base pressure.
 3. **Lid needs two OPEN clicks.** Likely cause: the PLC re-asserts the close bit (CIO12.08) while the open bit (CIO12.07) is 0, so releasing 12.08 before asserting 12.07 does not take on the first try. Workaround in v1.0.5: `_open_lid` reads CIO12 back after 500 ms and repeats the sequence once if the lid is not open. Confirmed working on hardware. The ladder export shows the vendor HMI instead set request bits 108.11 (do_open_lid) / 108.12 (do_close_lid) and let the PLC drive outputs 12.07/12.08; switching to those is a possible proper fix (untested).
 4. **Aborting a queue leaves `_queue_run_list` populated** (fixed in v1.1.0). `_abort_run` now clears it, `_run_current_recipe` clears it before a single run, and it is initialized in `_build_recipe_tab`.
-5. **Stop-flow is unreachable from the wizard.** `stopflow_enabled` is never set True (`_page_stopflow_enable` is not in the page list), so the per-step hold times on the Stop Flow page are ignored. The runner and recipe format support stop-flow; only the wizard path is dead. `_start_over` also omits `per_step_sf`.
+5. **Stop-flow is unreachable from the wizard** (fixed in v1.1.0). The wizard now asks "Use Stop Flow for any steps?" and skips the hold-time page when the answer is No. Untested on hardware.
 6. **Final popup update raises and is swallowed** (fixed in v1.1.0: the popup is gone; `_finish_run_success` calls `_mark_run_tab_complete`).
 7. **No offline detection after connecting.** `self.online` is set once by "Connect to Tool" and never cleared on timeouts. If the PLC drops, polling just returns None, the display goes stale, and writes report FAILED in the console only.
 8. **Blocking UDP on the UI thread.** Manual writes and the runner's valve toggles run on the Tk thread; a dead PLC freezes the UI for 1 s per call. Recipe valve timing also jitters with poll-thread socket contention.
 9. **Pending step timers survive abort.** `after()` callbacks for `close_line` and `end_hold_then_purge` are not cancelled. `end_hold_then_purge` can reopen V6 after an abort (harmless in practice because abort also opens V6).
 10. **Loggers.** `rotate_logs()` is never called, so old logs are never pruned. `DataLogger` picks its filename once and does not roll over at midnight. The "0000" no-data sentinel in the header and trend code is legacy: `parse_snapshot` never emits it.
 11. **Post-deposition tolerances unused** (see above; intentional).
-12. **Wizard prefill** ("Edit Recipe") restores lines, names and setpoints only; blocks and variants start empty.
-13. **Misc.** Evac comments mention PT2 while the code uses PT1. Many `SETPOINT_COMMANDS` entries (TE110, TE310, PT*) have no UI and are unverified. `_start_run` reads `setpoints["delay_min"]` without a default, so a recipe lacking it will raise.
+12. **Wizard prefill** (fixed in v1.1.0). "Change Recipe" rebuilds delivery settings (one per distinct line/pulse/purge), blocks and stop-flow hold times from the saved steps.
+13. **Misc.** Evac comments mention PT2 while the code uses PT1. Many `SETPOINT_COMMANDS` entries (TE110, TE310, PT*) have no UI and are unverified. `_start_run` reads `setpoints["delay_min"]` without a default, so a queued recipe file lacking it will raise (single runs are safe because the Recipe tab fills it in).
 
 ## Open items
 

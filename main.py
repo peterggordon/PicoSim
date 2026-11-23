@@ -140,6 +140,84 @@ TREND_WINDOW_SECONDS = 60
 # Plotting only; 1 Hz buffers + DATA.txt logging remain unchanged.
 PRESS_HI_HZ = 20.0  
 PRESS_HI_MAXLEN = int(TREND_WINDOW_SECONDS * PRESS_HI_HZ) + 5
+
+
+# ----------------------------
+# Recipe helpers (shared by the Recipe tab editor and the wizard)
+# ----------------------------
+
+# Setpoint keys in the order they appear in the recipe summary
+RECIPE_SUMMARY_KEYS = ("TE1", "TE2", "TE2_tol", "TE211", "TE210", "TE210_tol",
+                       "post_TE2", "post_TE2_tol", "post_TE210", "post_TE210_tol",
+                       "MFC1", "MFC100", "MFC200", "MFC300", "MFC400")
+
+
+def _hms(seconds: float) -> str:
+    """Format seconds as HH:MM:SS."""
+    try:
+        s = int(round(float(seconds)))
+    except Exception:
+        s = 0
+    return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
+
+
+def compute_recipe_time_s(blocks) -> float:
+    """Recipe execution time in seconds (excludes delay, pumpdown and warm-up).
+
+    Stop-flow steps take hold + purge; normal steps take pulse + purge.
+    """
+    total = 0.0
+    for blk in blocks:
+        one_cycle = 0.0
+        for step in blk.get("steps", []):
+            pulse = float(step.get("pulse_s", 0.0))
+            purge = float(step.get("purge_s", 0.0))
+            sf_pulse = float(step.get("sf_pulse_s", 0.0))
+            sf_hold = float(step.get("sf_hold_s", 0.0))
+            if sf_hold > 0 and sf_pulse > 0:
+                one_cycle += sf_hold + purge
+            else:
+                one_cycle += pulse + purge
+        total += one_cycle * int(blk.get("cycles", 0))
+    return total
+
+
+def build_recipe_summary(setpoints: dict, blocks, total_time_s: float) -> str:
+    """Plain-text summary stored in the recipe JSON and shown on the wizard confirm page."""
+    lines = ["Recipe Summary", "==============", ""]
+    lines.append(f"Delay (min): {setpoints.get('delay_min', '0')}")
+    lines.append("")
+    lines.append("Setpoints:")
+    for k in RECIPE_SUMMARY_KEYS:
+        lines.append(f"  {k}: {setpoints.get(k, '')}")
+    lines.append("")
+    lines.append("Blocks:")
+    for bi, blk in enumerate(blocks, start=1):
+        lines.append(f"  Block {bi}  cycles={blk['cycles']}")
+        for si, st in enumerate(blk["steps"], start=1):
+            lines.append(f"    {si}. {st['name']} (Line {st['line']})  pulse={st['pulse_s']}s purge={st['purge_s']}s  SF(p={st.get('sf_pulse_s', 0.0)},h={st.get('sf_hold_s', 0.0)})")
+    lines.append("")
+    lines.append(f"Total runtime (excluding stabilization delay): {_hms(total_time_s)}")
+    return "\n".join(lines)
+
+
+def validate_recipe_setpoints(sp: dict):
+    """Return an error message if a setpoint is missing or out of range, else None."""
+    labels = {"delay_min": "Delay (min)"}
+    for k in ("delay_min",) + RECIPE_SUMMARY_KEYS:
+        try:
+            val = float(sp.get(k, ""))
+        except Exception:
+            return f"{labels.get(k, k)} must be a number."
+        if val < 0:
+            return f"{labels.get(k, k)} must be >= 0."
+    if float(sp["TE1"]) > 400:
+        return "TE1 max must be <= 400 °C."
+    if float(sp["TE211"]) > 190:
+        return "TE211 max must be <= 190 °C."
+    return None
+
+
 class PicoSimApp(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1570,7 +1648,8 @@ class PicoSimApp(tk.Tk):
         btns.pack(side="right")
 
         ttk.Button(btns, text="Create Recipe", command=self._open_recipe_wizard).pack(side="left", padx=4)
-        ttk.Button(btns, text="Edit Recipe", command=lambda: self._open_recipe_wizard(prefill=True)).pack(side="left", padx=4)
+        # Change Recipe: precursors, pulse/purge, blocks, stop flow (setpoints and cycles are edited on this tab)
+        ttk.Button(btns, text="Change Recipe", command=lambda: self._open_recipe_wizard(change=True)).pack(side="left", padx=4)
         ttk.Button(btns, text="Start Over", command=self._clear_current_recipe).pack(side="left", padx=4)
 
         ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=8)
@@ -1625,9 +1704,21 @@ class PicoSimApp(tk.Tk):
             e.grid(row=r, column=1, sticky="w", padx=8, pady=2)
             ttk.Label(left, text=unit).grid(row=r, column=2, sticky="w")
 
+        # Edits to these fields go straight into the current recipe (see _on_recipe_setpoint_edit)
+        self._suppress_recipe_edits = False
+        self._recipe_dirty = False
+        for key, var in self.recipe_setpoint_vars.items():
+            var.trace_add("write", lambda *_a, k=key: self._on_recipe_setpoint_edit(k))
+
         # Right: recipe steps tree + controls
         right = ttk.Frame(mid)
         right.pack(side="left", fill="both", expand=True)
+
+        # Editable cycles per block and precursor name per line (rebuilt for each recipe)
+        self.recipe_struct_frame = ttk.LabelFrame(right, text="Cycles and Precursors")
+        self.recipe_struct_frame.pack(fill="x", pady=(0, 8))
+        self._block_cycle_vars = []
+        self._line_name_vars = {}
 
         tree_frame = ttk.LabelFrame(right, text="Current Recipe")
         tree_frame.pack(fill="both", expand=True)
@@ -1687,17 +1778,125 @@ class PicoSimApp(tk.Tk):
         self.delay_clock_var = tk.StringVar(value="--:--")
         self.run_timing_var = tk.StringVar(value="Est. start: --   Est. end: --")
 
+        self.current_recipe_path = None
+        self._build_recipe_structure_editor()
+
     # ----------------------------
     # Recipe persistence / UI
     # ----------------------------
 
     def _clear_current_recipe(self):
         self.current_recipe = None
+        self.current_recipe_path = None
+        self._recipe_dirty = False
         if hasattr(self, "recipe_tree"):
             for i in self.recipe_tree.get_children():
                 self.recipe_tree.delete(i)
+        self._build_recipe_structure_editor()
         if hasattr(self, "recipe_status"):
             self.recipe_status.config(text="Create a recipe to begin.")
+
+    # ----------------------------
+    # In-place recipe editing (Recipe tab)
+    # ----------------------------
+
+    def _build_recipe_structure_editor(self):
+        """Rebuild the 'Cycles and Precursors' fields for the current recipe."""
+        frame = self.recipe_struct_frame
+        for w in frame.winfo_children():
+            w.destroy()
+        self._block_cycle_vars = []
+        self._line_name_vars = {}
+
+        if not self.current_recipe:
+            ttk.Label(frame, text="Create or load a recipe to edit cycles and precursor names.", foreground="gray").grid(row=0, column=0, sticky="w", padx=8, pady=4)
+            return
+
+        # Columns 0-1: cycles per block
+        for i, blk in enumerate(self.current_recipe.get("blocks", [])):
+            ttk.Label(frame, text=f"Block {i + 1} cycles").grid(row=i, column=0, sticky="w", padx=8, pady=2)
+            v = tk.StringVar(value=str(blk.get("cycles", 1)))
+            ttk.Entry(frame, textvariable=v, width=8).grid(row=i, column=1, sticky="w", padx=4, pady=2)
+            v.trace_add("write", lambda *_a, idx=i: self._on_block_cycles_edit(idx))
+            self._block_cycle_vars.append(v)
+
+        # Columns 2-3: precursor name per line
+        for r, (line, name) in enumerate(self._sorted_line_names(self.current_recipe)):
+            ttk.Label(frame, text=f"Line {line} precursor").grid(row=r, column=2, sticky="w", padx=(30, 8), pady=2)
+            v = tk.StringVar(value=str(name))
+            ttk.Entry(frame, textvariable=v, width=20).grid(row=r, column=3, sticky="w", padx=4, pady=2)
+            v.trace_add("write", lambda *_a, ln=line: self._on_line_name_edit(ln))
+            self._line_name_vars[line] = v
+
+    def _on_recipe_setpoint_edit(self, key: str):
+        """A setpoint field on the Recipe tab changed: copy it into the current recipe."""
+        if self._suppress_recipe_edits or not self.current_recipe:
+            return
+        self.current_recipe.setdefault("setpoints", {})[key] = self.recipe_setpoint_vars[key].get().strip()
+        self._after_recipe_edit()
+
+    def _on_block_cycles_edit(self, idx: int):
+        if self._suppress_recipe_edits or not self.current_recipe:
+            return
+        try:
+            n = int(self._block_cycle_vars[idx].get().strip())
+        except Exception:
+            n = 0
+        if n >= 1:
+            self.current_recipe["blocks"][idx]["cycles"] = n
+        # Invalid values stay in the field; _validate_recipe_edits blocks Run/Save until fixed
+        self._after_recipe_edit()
+
+    def _on_line_name_edit(self, line: int):
+        if self._suppress_recipe_edits or not self.current_recipe:
+            return
+        name = self._line_name_vars[line].get().strip()
+        if name:
+            self.current_recipe.setdefault("line_names", {})[str(line)] = name
+            for blk in self.current_recipe.get("blocks", []):
+                for st in blk.get("steps", []):
+                    if int(st.get("line", 0)) == line:
+                        st["name"] = name
+        self._after_recipe_edit()
+
+    def _after_recipe_edit(self):
+        """Recompute time and summary, refresh the step table, mark unsaved."""
+        rcp = self.current_recipe
+        rcp["total_time_s"] = compute_recipe_time_s(rcp.get("blocks", []))
+        rcp["summary"] = build_recipe_summary(rcp.get("setpoints", {}), rcp.get("blocks", []), rcp["total_time_s"])
+        self._recipe_dirty = True
+        self._refresh_recipe_tree_rows()
+        self._refresh_recipe_status()
+
+    def _validate_recipe_edits(self):
+        """Return an error message if the Recipe tab holds invalid values, else None."""
+        if not self.current_recipe:
+            return None
+        err = validate_recipe_setpoints(self.current_recipe.get("setpoints", {}))
+        if err:
+            return err
+        for i, v in enumerate(self._block_cycle_vars, start=1):
+            try:
+                if int(v.get().strip()) < 1:
+                    raise ValueError
+            except Exception:
+                return f"Block {i} cycles must be a whole number >= 1."
+        for line, v in self._line_name_vars.items():
+            if not v.get().strip():
+                return f"Enter a precursor name for Line {line}."
+        return None
+
+    def _refresh_recipe_status(self):
+        if not self.current_recipe:
+            self.recipe_status.config(text="Create a recipe to begin.")
+            return
+        txt = f"Recipe: {self.current_recipe.get('title', '(unnamed)')}"
+        if self.current_recipe_path:
+            txt += f"  File: {pathlib.Path(self.current_recipe_path).name}"
+        txt += f"  Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(self.current_recipe))}"
+        if self._recipe_dirty:
+            txt += "  [Unsaved changes]"
+        self.recipe_status.config(text=txt)
 
     def _rebuild_line_indicators(self, selected_lines):
         self.line_indicators = {}
@@ -1727,6 +1926,10 @@ class PicoSimApp(tk.Tk):
         if not self.current_recipe:
             messagebox.showinfo("No recipe", "Create a recipe first.")
             return
+        err = self._validate_recipe_edits()
+        if err:
+            messagebox.showerror("Invalid recipe", err)
+            return
         path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("Recipe JSON", "*.json")])
         if not path:
             return
@@ -1735,7 +1938,8 @@ class PicoSimApp(tk.Tk):
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(self.current_recipe, f, indent=2)
                 self.current_recipe_path = path
-            self.recipe_status.config(text=f"Saved: {path}")
+            self._recipe_dirty = False
+            self._refresh_recipe_status()
         except Exception as e:
             messagebox.showerror("Save failed", str(e))
 
@@ -1755,15 +1959,8 @@ class PicoSimApp(tk.Tk):
                 return
             self.current_recipe = recipe
             self.current_recipe_path = path
-
-            # Update setpoint widgets (best-effort)
-            sp = recipe.get("setpoints", {})
-            for k, var in getattr(self, "recipe_setpoint_vars", {}).items():
-                if k in sp:
-                    var.set(str(sp.get(k, "")))
-
+            self._recipe_dirty = False
             self._populate_recipe_tree()
-            self.recipe_status.config(text=f"Loaded: {path}  Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(self.current_recipe))}")
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
     def _open_queue_builder(self):
@@ -1818,6 +2015,26 @@ class PicoSimApp(tk.Tk):
         ttk.Button(btns, text="Move Down", command=lambda: move(1)).pack(fill="x", pady=2)
 
     def _populate_recipe_tree(self):
+        """Show the current recipe on the Recipe tab: setpoint fields, cycles/precursors, step table."""
+        if self.current_recipe:
+            sp = self.current_recipe.setdefault("setpoints", {})
+            # Older recipe files may lack some setpoints. Fill them in so the fields show what the run will use.
+            if "post_TE210" not in sp and "TE210" in sp:
+                sp["post_TE210"] = sp["TE210"]  # matches the old fallback in _finish_run_success
+            sp.setdefault("delay_min", "0")
+            self._suppress_recipe_edits = True
+            try:
+                for k, var in self.recipe_setpoint_vars.items():
+                    if k not in sp:
+                        sp[k] = var.get()
+                    var.set(str(sp[k]))
+            finally:
+                self._suppress_recipe_edits = False
+        self._build_recipe_structure_editor()
+        self._refresh_recipe_tree_rows()
+        self._refresh_recipe_status()
+
+    def _refresh_recipe_tree_rows(self):
         for i in self.recipe_tree.get_children():
             self.recipe_tree.delete(i)
         if not self.current_recipe:
@@ -1842,8 +2059,6 @@ class PicoSimApp(tk.Tk):
                     ),
                 )
 
-        self.recipe_status.config(text=f"Loaded recipe: {self.current_recipe.get('title','(unnamed)')}  Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(self.current_recipe))}")
-
     def _sorted_line_names(self, recipe: dict):
         """Return [(line_no, name), ...] sorted by line number."""
         out = []
@@ -1859,8 +2074,11 @@ class PicoSimApp(tk.Tk):
     # Recipe wizard
     # ----------------------------
 
-    def _open_recipe_wizard(self, prefill: bool = False):
-        RecipeWizard(self, prefill=prefill)
+    def _open_recipe_wizard(self, change: bool = False):
+        if change and not self.current_recipe:
+            messagebox.showinfo("No recipe", "Create or load a recipe first.")
+            return
+        RecipeWizard(self, change=change)
 
     # ----------------------------
     # Runner
@@ -1872,6 +2090,10 @@ class PicoSimApp(tk.Tk):
             return
         if self.run_state is not None:
             messagebox.showwarning("Already running", "A recipe is already running.")
+            return
+        err = self._validate_recipe_edits()
+        if err:
+            messagebox.showerror("Invalid recipe", err)
             return
         self.run_abort_flag = False
         # A single run is never part of a queue (clears any leftover queue list)
@@ -2641,33 +2863,25 @@ class PicoSimApp(tk.Tk):
 
 
 class RecipeWizard(tk.Toplevel):
-    """Wizard-style popup for creating/editing a recipe."""
+    """Wizard-style popup for creating a recipe, or changing the structure of the current one.
 
-    def __init__(self, app: PicoSimApp, prefill: bool = False):
+    change=False (Create Recipe): every page, starting from empty.
+    change=True  (Change Recipe): starts from the current recipe and only covers precursors,
+    pulse/purge settings, blocks and stop flow. Delay, setpoints and cycles are edited on the Recipe tab.
+    """
+
+    CREATE_PAGES = ["delay", "lines", "names", "variants", "blocks", "sf_enable", "sf_times", "setpoints", "confirm"]
+    CHANGE_PAGES = ["lines", "names", "variants", "blocks", "sf_enable", "sf_times", "confirm"]
+
+    def __init__(self, app: PicoSimApp, change: bool = False):
         super().__init__(app)
         self.app = app
-        self.title("Create Recipe")
+        self.change_mode = bool(change and app.current_recipe)
+        self.title("Change Recipe" if self.change_mode else "Create Recipe")
         self.geometry("820x520")
         self.resizable(False, False)
 
-        self.data = {
-            "selected_lines": [],
-            "line_names": {},
-            "variants": {},        # variant_id -> dict(line, pulse_s, purge_s)
-            "blocks": [],          # list of {steps:[variant_id...], cycles:int}
-            "stopflow_enabled": False,
-            "setpoints": {},
-            "per_step_sf": [],     # expanded sf settings parallel to expanded steps
-        }
-
-        if prefill and app.current_recipe:
-            try:
-                self.data["selected_lines"] = [int(k) for k in app.current_recipe["line_names"].keys()]
-                self.data["line_names"] = {str(k): v for k, v in app.current_recipe["line_names"].items()}
-                self.data["setpoints"] = dict(app.current_recipe["setpoints"])
-                # Variants and blocks are not perfectly reconstructable from expanded steps, so we start from scratch there.
-            except Exception:
-                pass
+        self._reset_data()
 
         # wizard navigation
         nav = ttk.Frame(self)
@@ -2682,75 +2896,115 @@ class RecipeWizard(tk.Toplevel):
         self.page_container = ttk.Frame(self)
         self.page_container.pack(fill="both", expand=True, padx=10, pady=10)
 
-        self.pages = []
+        self.page_keys = list(self.CHANGE_PAGES if self.change_mode else self.CREATE_PAGES)
+        self.pages = {}
         self.page_index = 0
 
         self._build_pages()
         self._show_page(0)
 
-    def _start_over(self):
+    def _reset_data(self):
         self.data = {
             "selected_lines": [],
             "line_names": {},
-            "variants": {},
-            "blocks": [],
+            "variants": {},        # variant_id -> dict(line, pulse_s, purge_s)
+            "blocks": [],          # list of {steps:[variant_id...], cycles:int}
             "stopflow_enabled": False,
             "setpoints": {},
+            "per_step_sf": [],     # expanded sf settings parallel to expanded steps
         }
+        if self.change_mode:
+            self._prefill_from_recipe(self.app.current_recipe)
+
+    def _prefill_from_recipe(self, recipe: dict):
+        """Rebuild wizard data (lines, names, delivery settings, blocks, stop flow) from a saved recipe."""
+        line_names = {str(k): v for k, v in (recipe.get("line_names", {}) or {}).items()}
+        self.data["line_names"] = line_names
+        self.data["setpoints"] = dict(recipe.get("setpoints", {}) or {})
+
+        # Each distinct (line, pulse, purge) becomes one delivery setting ("variant")
+        variants = {}
+        key_to_vid = {}
+        per_line = {}
+        blocks = []
+        per_step_sf = []
+        lines_used = set()
+        for blk in recipe.get("blocks", []):
+            vids = []
+            for st in blk.get("steps", []):
+                ln = int(st.get("line", 0))
+                lines_used.add(ln)
+                if str(ln) not in line_names:
+                    line_names[str(ln)] = st.get("name") or f"Line{ln}"
+                pulse = float(st.get("pulse_s", 0.0))
+                purge = float(st.get("purge_s", 0.0))
+                key = (ln, pulse, purge)
+                if key not in key_to_vid:
+                    per_line[ln] = per_line.get(ln, 0) + 1
+                    vid = self._make_variant_id(ln, per_line[ln])
+                    key_to_vid[key] = vid
+                    variants[vid] = {"line": ln, "pulse_s": pulse, "purge_s": purge}
+                vids.append(key_to_vid[key])
+                per_step_sf.append({"sf_hold_s": float(st.get("sf_hold_s", 0.0) or 0.0)})
+            blocks.append({"steps": vids, "cycles": int(blk.get("cycles", 1))})
+
+        self.data["selected_lines"] = sorted(lines_used | {int(k) for k in line_names})
+        self.data["variants"] = variants
+        self.data["blocks"] = blocks
+        self.data["per_step_sf"] = per_step_sf
+        self.data["stopflow_enabled"] = any(x["sf_hold_s"] > 0 for x in per_step_sf)
+
+    def _start_over(self):
+        # Create: back to empty. Change: back to the recipe as it is on the Recipe tab.
+        self._reset_data()
         self.page_index = 0
         self._build_pages()
         self._show_page(0)
+
+    def _page_builders(self):
+        return {
+            "delay": self._page_delay,
+            "lines": self._page_choose_lines,
+            "names": self._page_names,
+            "variants": self._page_define_variants,
+            "blocks": self._page_build_blocks,
+            "sf_enable": self._page_stopflow_enable,
+            "sf_times": self._page_stopflow_times,
+            "setpoints": self._page_setpoints,
+            "confirm": self._page_confirm,
+        }
 
     def _build_pages(self):
         for w in self.page_container.winfo_children():
             w.destroy()
-        self.pages = []
+        builders = self._page_builders()
+        self.pages = {key: builders[key]() for key in self.page_keys}
 
-        self.pages.append(self._page_delay())
-        self.pages.append(self._page_choose_lines())
-        self.pages.append(self._page_names())
-        self.pages.append(self._page_define_variants())
-        self.pages.append(self._page_build_blocks())
-        self.pages.append(self._page_stopflow_times())
-        self.pages.append(self._page_setpoints())
-        self.pages.append(self._page_confirm())
+    def _page_skipped(self, key: str) -> bool:
+        # Stop Flow hold times are only asked for when stop flow is enabled
+        return key == "sf_times" and not self.data.get("stopflow_enabled", False)
 
     def _show_page(self, idx: int):
         # Hide current page
         for w in self.page_container.winfo_children():
             w.pack_forget()
 
+        key = self.page_keys[idx]
+
         # Rebuild pages that depend on earlier choices (names/selected lines/blocks)
-        if idx == 3:
-            # Define precursor delivery settings depends on selected lines + names
+        if key in ("variants", "blocks", "sf_times"):
             try:
-                self.pages[3].destroy()
+                self.pages[key].destroy()
             except Exception:
                 pass
-            self.pages[3] = self._page_define_variants()
-
-        if idx == 4:
-            # Block builder depends on variants + any prior block edits
-            try:
-                self.pages[4].destroy()
-            except Exception:
-                pass
-            self.pages[4] = self._page_build_blocks()
-
-        if idx == 5:
-            # Stop Flow timings depend on the expanded step list (blocks)
-            try:
-                self.pages[5].destroy()
-            except Exception:
-                pass
-            self.pages[5] = self._page_stopflow_times()
+            self.pages[key] = self._page_builders()[key]()
 
         self.page_index = idx
 
-        self.pages[idx].pack(fill="both", expand=True)
+        self.pages[key].pack(fill="both", expand=True)
 
         # Populate confirmation summary on entry
-        if idx == 7:
+        if key == "confirm":
             try:
                 recipe = self._build_final_recipe(only_build=True)
                 self.summary_txt.delete("1.0", "end")
@@ -2759,27 +3013,35 @@ class RecipeWizard(tk.Toplevel):
                 pass
 
         self.back_btn.state(["!disabled"] if idx > 0 else ["disabled"])
-        self.next_btn.config(text="Finish" if idx == (len(self.pages) - 1) else "Next")
+        self.next_btn.config(text="Finish" if idx == (len(self.page_keys) - 1) else "Next")
 
     def _back(self):
-        if self.page_index > 0:
-            self._show_page(self.page_index - 1)
+        idx = self.page_index - 1
+        while idx > 0 and self._page_skipped(self.page_keys[idx]):
+            idx -= 1
+        if idx >= 0:
+            self._show_page(idx)
 
     def _next(self):
         # Validate current page
-        if not self._validate_page(self.page_index):
+        if not self._validate_page(self.page_keys[self.page_index]):
             return
 
-        if self.page_index == (len(self.pages) - 1):
+        if self.page_index == (len(self.page_keys) - 1):
             # Finish: commit to app
             recipe = self._build_final_recipe()
+            if not self.change_mode:
+                self.app.current_recipe_path = None  # a new recipe has no file yet
             self.app.current_recipe = recipe
+            self.app._recipe_dirty = True
             self.app._populate_recipe_tree()
             self.destroy()
             return
 
-        self._show_page(self.page_index + 1)
-
+        idx = self.page_index + 1
+        while idx < len(self.page_keys) - 1 and self._page_skipped(self.page_keys[idx]):
+            idx += 1
+        self._show_page(idx)
 
     def _sanitize_name(self, name: str) -> str:
         """Make a stable identifier from a user-facing precursor name."""
@@ -2833,7 +3095,8 @@ class RecipeWizard(tk.Toplevel):
 
     def _page_stopflow_enable(self):
         f = ttk.Frame(self.page_container)
-        ttk.Label(f, text="Do you want a Stop Flow step option?", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(f, text="Use Stop Flow for any steps?", font=("Arial", 12, "bold")).pack(anchor="w", pady=(0, 10))
+        ttk.Label(f, text="If Yes, the next page sets a Stop Flow hold time for each step (0 = normal step).").pack(anchor="w", pady=(0, 10))
         self.stopflow_enabled_var = tk.BooleanVar(value=bool(self.data.get("stopflow_enabled", False)))
         ttk.Radiobutton(f, text="Yes", variable=self.stopflow_enabled_var, value=True).pack(anchor="w")
         ttk.Radiobutton(f, text="No", variable=self.stopflow_enabled_var, value=False).pack(anchor="w")
@@ -2867,9 +3130,10 @@ class RecipeWizard(tk.Toplevel):
         self.variant_rows = []
         selected = [int(x) for x in self.data.get("selected_lines", [])]
 
-        # Seed: one default setting per selected line if none exist yet
-        if not self.data["variants"]:
-            for ln in selected:
+        # Seed: one default setting for each selected line that has none yet
+        lines_with_settings = {int(v.get("line", 0)) for v in self.data["variants"].values()}
+        for ln in selected:
+            if ln not in lines_with_settings:
                 vid = self._make_variant_id(ln, 1)
                 self.data["variants"][vid] = {"line": ln, "pulse_s": 0.1, "purge_s": 0.1}
 
@@ -3089,6 +3353,9 @@ class RecipeWizard(tk.Toplevel):
 
         self.sf_rows = []
         steps = self._expanded_steps_for_sf()
+        prev = self.data.get("per_step_sf", []) or []
+        if len(prev) != len(steps):
+            prev = []  # steps changed; previous hold times no longer line up
         r = 1
         for idx, (vid, vdat) in enumerate(steps, start=1):
             line = int(vdat.get("line", 0))
@@ -3099,7 +3366,8 @@ class RecipeWizard(tk.Toplevel):
             ttk.Label(self.sf_table, text=str(line)).grid(row=r, column=2, padx=6, pady=2, sticky="w")
             ttk.Label(self.sf_table, text=f"{pulse_total:.3g}").grid(row=r, column=3, padx=6, pady=2, sticky="w")
 
-            hv = tk.StringVar(value="0")
+            prev_h = float(prev[idx - 1].get("sf_hold_s", 0.0)) if prev else 0.0
+            hv = tk.StringVar(value=f"{prev_h:g}")
             ttk.Entry(self.sf_table, textvariable=hv, width=12).grid(row=r, column=4, padx=6, pady=2, sticky="w")
             self.sf_rows.append((vid, vdat, hv))
             r += 1
@@ -3167,28 +3435,35 @@ class RecipeWizard(tk.Toplevel):
         return f"{h:02d}:{m:02d}:{ss:02d}"
     # ----- Validation / build -----
 
-    def _validate_page(self, idx: int) -> bool:
-        if idx == 0:
+    def _validate_page(self, key: str) -> bool:
+        if key == "delay":
             try:
                 v = int(self.delay_var.get())
                 if v < 0:
                     raise ValueError
-                self.app.recipe_setpoint_vars["delay_min"].set(str(v))
                 self.data["setpoints"]["delay_min"] = str(v)
                 return True
             except Exception:
                 messagebox.showerror("Invalid delay", "Enter a whole number >= 0.")
                 return False
 
-        if idx == 1:
+        if key == "lines":
             selected = [i for i, var in self.line_vars.items() if var.get()]
             if not selected:
                 messagebox.showwarning("No lines", "Select at least one precursor line.")
                 return False
+            # Drop delivery settings and block steps for lines that were unselected
+            removed = [ln for ln in self.data["selected_lines"] if ln not in selected]
+            if removed:
+                self.data["variants"] = {vid: v for vid, v in self.data["variants"].items()
+                                         if int(v.get("line", 0)) not in removed}
+                for blk in self.data["blocks"]:
+                    blk["steps"] = [vid for vid in blk["steps"] if vid in self.data["variants"]]
+                self.data["per_step_sf"] = []
             self.data["selected_lines"] = selected
             return True
 
-        if idx == 2:
+        if key == "names":
             selected = self.data["selected_lines"]
             names = {}
             for i in selected:
@@ -3202,17 +3477,22 @@ class RecipeWizard(tk.Toplevel):
             # Rename any existing variants to use the precursor name as prefix: precursor.<n>
             if self.data.get("variants"):
                 new_variants = {}
+                renamed = {}
                 per_line_count = {}
-                for _old_vid, vdat in list(self.data["variants"].items()):
+                for old_vid, vdat in list(self.data["variants"].items()):
                     ln = int(vdat.get("line", 0))
                     per_line_count[ln] = per_line_count.get(ln, 0) + 1
                     new_vid = self._make_variant_id(ln, per_line_count[ln])
                     new_variants[new_vid] = vdat
+                    renamed[old_vid] = new_vid
                 self.data["variants"] = new_variants
+                # Keep block steps pointing at the renamed settings
+                for blk in self.data["blocks"]:
+                    blk["steps"] = [renamed.get(vid, vid) for vid in blk["steps"]]
 
             return True
 
-        if idx == 3:
+        if key == "variants":
             self._sync_variants_from_table()
             # Basic validation: times >=0, warn if both 0
             for vid, vdat in self.data["variants"].items():
@@ -3225,7 +3505,7 @@ class RecipeWizard(tk.Toplevel):
                         return False
             return True
 
-        if idx == 4:
+        if key == "blocks":
             # blocks must all have cycles and at least 1 step; last block too
             for bi, blk in enumerate(self.data["blocks"], start=1):
                 if not blk["steps"]:
@@ -3236,7 +3516,11 @@ class RecipeWizard(tk.Toplevel):
                     return False
             return True
 
-        if idx == 5:
+        if key == "sf_enable":
+            self.data["stopflow_enabled"] = bool(self.stopflow_enabled_var.get())
+            return True
+
+        if key == "sf_times":
             if not self.data.get("stopflow_enabled", False):
                 self.data["per_step_sf"] = []
                 return True
@@ -3272,7 +3556,7 @@ class RecipeWizard(tk.Toplevel):
 
 
 
-        if idx == 6:
+        if key == "setpoints":
             # setpoints validation
             try:
                 TE1 = float(self.sp_TE1.get()); TE2 = float(self.sp_TE2.get())
@@ -3309,7 +3593,7 @@ class RecipeWizard(tk.Toplevel):
             self.data["setpoints"] = sp
             return True
 
-        if idx == 7:
+        if key == "confirm":
             # Build and show summary
             recipe = self._build_final_recipe(only_build=True)
             self.summary_txt.delete("1.0", "end")
@@ -3336,12 +3620,15 @@ class RecipeWizard(tk.Toplevel):
         self._sync_variants_from_table()
         line_names = self.data["line_names"]
         sp = self.data["setpoints"]
+        old = self.app.current_recipe if self.change_mode else None
+        if old:
+            # Change Recipe keeps the setpoints as they are now on the Recipe tab
+            sp = dict(old.get("setpoints", {}))
 
         # Expand blocks into steps with names and per-step stopflow settings
         blocks_out = []
         sf_list = list(self.data.get("per_step_sf", []))
         sf_idx = 0
-        total_time = 0.0
 
         for blk in self.data["blocks"]:
             steps_out = []
@@ -3368,44 +3655,9 @@ class RecipeWizard(tk.Toplevel):
                 sf_idx += 1
                 steps_out.append(step)
 
-                # time
-                if step["sf_hold_s"] > 0 and step["sf_pulse_s"] > 0:
-                    total_time += step["sf_hold_s"] + step["purge_s"]
-                else:
-                    total_time += step["pulse_s"] + step["purge_s"]
-
             blocks_out.append({"cycles": int(blk["cycles"]), "steps": steps_out})
-            total_time *= int(blk["cycles"])
 
-        # Above multiplication is wrong (it multiplies cumulative), so compute properly:
-        total_time = 0.0
-        for blk in blocks_out:
-            one_cycle = 0.0
-            for step in blk["steps"]:
-                if step["sf_hold_s"] > 0 and step["sf_pulse_s"] > 0:
-                    one_cycle += step["sf_hold_s"] + step["purge_s"]
-                else:
-                    one_cycle += step["pulse_s"] + step["purge_s"]
-            total_time += one_cycle * int(blk["cycles"])
-
-        # summary text
-        lines = []
-        lines.append("Recipe Summary")
-        lines.append("==============")
-        lines.append("")
-        lines.append(f"Delay (min): {sp.get('delay_min','0')}")
-        lines.append("")
-        lines.append("Setpoints:")
-        for k in ("TE1","TE2","TE2_tol","TE211","TE210","TE210_tol","post_TE2","post_TE2_tol","post_TE210","post_TE210_tol","MFC1","MFC100","MFC200","MFC300","MFC400"):
-            lines.append(f"  {k}: {sp.get(k,'')}")
-        lines.append("")
-        lines.append("Blocks:")
-        for bi, blk in enumerate(blocks_out, start=1):
-            lines.append(f"  Block {bi}  cycles={blk['cycles']}")
-            for si, st in enumerate(blk["steps"], start=1):
-                lines.append(f"    {si}. {st['name']} (Line {st['line']})  pulse={st['pulse_s']}s purge={st['purge_s']}s  SF(p={st['sf_pulse_s']},h={st['sf_hold_s']})")
-        lines.append("")
-        lines.append(f"Total runtime (excluding stabilization delay): {self._seconds_to_hms(total_time)}")
+        total_time = compute_recipe_time_s(blocks_out)
 
         recipe = {
             "title": f"Recipe {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
@@ -3414,8 +3666,12 @@ class RecipeWizard(tk.Toplevel):
             "setpoints": sp,
             "blocks": blocks_out,
             "total_time_s": total_time,
-            "summary": "\n".join(lines),
+            "summary": build_recipe_summary(sp, blocks_out, total_time),
         }
+        if old:
+            # Same recipe, changed: keep its title and creation time
+            recipe["title"] = old.get("title", recipe["title"])
+            recipe["created"] = old.get("created", recipe["created"])
 
         if only_build:
             return recipe
