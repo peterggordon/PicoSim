@@ -11,6 +11,7 @@ import time
 from collections import deque
 from datetime import datetime, timedelta
 import re
+import copy
 import pathlib
 
 from network import FINSClient
@@ -25,7 +26,7 @@ from itertools import cycle
 
 
 # GUI version (shown in the window title)
-APP_VERSION = "1.0.5"
+APP_VERSION = "1.1.0"
 
 MAX_HEAT_NOTE_MSG = (
     "Note: Maximum heating setpoint is not high enough.  "
@@ -1673,28 +1674,18 @@ class PicoSimApp(tk.Tk):
         # Runner state
         self.current_recipe = None
         self.recipe_queue = []
-        self._close_run_progress_popup()
-        # If not running a queue, stop hi-res capture at end of this recipe.
-        if not getattr(self, '_queue_run_list', None):
-            self._stop_run_hires_capture()
-
+        self._queue_run_list = []
         self.run_state = None
         self.run_abort_flag = False
 
-        # Run monitor UI (delay clock + line indicators + progress)
-        self.run_monitor = ttk.LabelFrame(self.recipe_tab, text="Run Monitor")
-        self.run_monitor.pack(fill="x", padx=10, pady=(0, 10))
-
+        # Run tab (created when a run starts; see _show_run_tab).
+        # The delay clock, timing text and line indicators live on that tab.
+        self.run_tab = None
+        self._run_progress_vars = None
+        self.line_indicator_frame = None
+        self.line_indicators = {}  # line -> canvas
         self.delay_clock_var = tk.StringVar(value="--:--")
-        self.delay_clock_lbl = ttk.Label(self.run_monitor, textvariable=self.delay_clock_var, font=("Courier New", 18, "bold"), foreground="red")
-        self.delay_clock_lbl.pack(side="left", padx=10)
-
-        self.run_timing_var = tk.StringVar(value="Start: --   End: --")
-        ttk.Label(self.run_monitor, textvariable=self.run_timing_var).pack(side="left", padx=10)
-
-        self.line_indicator_frame = ttk.Frame(self.run_monitor)
-        self.line_indicator_frame.pack(side="right", padx=10)
-        self.line_indicators = {}  # line -> (canvas, label)
+        self.run_timing_var = tk.StringVar(value="Est. start: --   Est. end: --")
 
     # ----------------------------
     # Recipe persistence / UI
@@ -1707,12 +1698,14 @@ class PicoSimApp(tk.Tk):
                 self.recipe_tree.delete(i)
         if hasattr(self, "recipe_status"):
             self.recipe_status.config(text="Create a recipe to begin.")
-        self._rebuild_line_indicators([])
 
     def _rebuild_line_indicators(self, selected_lines):
-        for w in self.line_indicator_frame.winfo_children():
-            w.destroy()
         self.line_indicators = {}
+        frame = getattr(self, "line_indicator_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        for w in frame.winfo_children():
+            w.destroy()
         for line, name in selected_lines:
             f = ttk.Frame(self.line_indicator_frame)
             f.pack(side="left", padx=6)
@@ -1770,7 +1763,7 @@ class PicoSimApp(tk.Tk):
                     var.set(str(sp.get(k, "")))
 
             self._populate_recipe_tree()
-            self.recipe_status.config(text=f"Loaded: {path}  Total time: {self._seconds_to_hms(self.current_recipe.get('total_time_s',0))}")
+            self.recipe_status.config(text=f"Loaded: {path}  Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(self.current_recipe))}")
         except Exception as e:
             messagebox.showerror("Load failed", str(e))
     def _open_queue_builder(self):
@@ -1849,13 +1842,18 @@ class PicoSimApp(tk.Tk):
                     ),
                 )
 
-        self.recipe_status.config(text=f"Loaded recipe: {self.current_recipe.get('title','(unnamed)')}  Total time: {self._seconds_to_hms(self.current_recipe.get('total_time_s',0))}")
+        self.recipe_status.config(text=f"Loaded recipe: {self.current_recipe.get('title','(unnamed)')}  Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(self.current_recipe))}")
 
-        # build indicators
-        selected_lines = [(ln, nm) for ln, nm in self.current_recipe.get("line_names", {}).items()]
-        selected_lines = [(int(k), v) for k, v in selected_lines]
-        selected_lines.sort(key=lambda x: x[0])
-        self._rebuild_line_indicators(selected_lines)
+    def _sorted_line_names(self, recipe: dict):
+        """Return [(line_no, name), ...] sorted by line number."""
+        out = []
+        for k, v in (recipe.get("line_names", {}) or {}).items():
+            try:
+                out.append((int(k), v))
+            except Exception:
+                pass
+        out.sort(key=lambda x: x[0])
+        return out
 
     # ----------------------------
     # Recipe wizard
@@ -1876,7 +1874,13 @@ class PicoSimApp(tk.Tk):
             messagebox.showwarning("Already running", "A recipe is already running.")
             return
         self.run_abort_flag = False
-        self._start_run(self.current_recipe)
+        # A single run is never part of a queue (clears any leftover queue list)
+        self._queue_run_list = []
+        self._queue_run_active = False
+        # A new run replaces the previous run's tab
+        self._close_run_tab()
+        # Run a copy, so edits on the Recipe tab during the run do not change the running recipe
+        self._start_run(copy.deepcopy(self.current_recipe))
 
     def _run_queue(self):
         if not self.recipe_queue:
@@ -1904,6 +1908,8 @@ class PicoSimApp(tk.Tk):
         self._queue_run_active = True
         self._queue_run_index = 0
         self.run_abort_flag = False
+        # A new run replaces the previous run's tab
+        self._close_run_tab()
         self._start_run(self._queue_run_list[0])
 
 
@@ -1918,11 +1924,15 @@ class PicoSimApp(tk.Tk):
             "current_step": 0,
             "cycle_left_in_block": None,
             "step_active_until": None,
+            "seq_started": None,
         }
         self.recipe_status.config(text="Run: starting pre-checks...")
-        self._show_run_progress_popup()
         self.delay_clock_var.set("--:--")
-        self.run_timing_var.set("Start: --   End: --")
+        self.run_timing_var.set("Est. start: --   Est. end: --")
+
+        # Show the Run tab (a queue keeps the same tab from one recipe to the next)
+        self._show_run_tab()
+        self._set_run_tab_recipe(recipe)
 
         # Start hi-res run capture
         self._start_run_hires_capture(recipe)
@@ -1931,65 +1941,188 @@ class PicoSimApp(tk.Tk):
         self.after(100, self._run_tick)
 
     # ----------------------------
-    # Run progress popup
+    # Run tab (appears when a run starts; removed on abort;
+    # stays after completion until dismissed or a new run starts)
     # ----------------------------
-    def _show_run_progress_popup(self):
-        """Create (or raise) a small popup showing what the run is waiting on / doing."""
+    def _recipe_total_with_delay_s(self, recipe: dict) -> float:
+        """Delay plus recipe time, in seconds. Excludes pumpdown and warm-up."""
         try:
-            if getattr(self, "_run_progress_win", None) and self._run_progress_win.winfo_exists():
-                self._run_progress_win.deiconify()
-                self._run_progress_win.lift()
-                return
+            delay_s = float((recipe.get("setpoints", {}) or {}).get("delay_min", 0) or 0) * 60.0
         except Exception:
-            pass
+            delay_s = 0.0
+        try:
+            recipe_s = float(recipe.get("total_time_s", 0) or 0)
+        except Exception:
+            recipe_s = 0.0
+        return delay_s + recipe_s
 
-        win = tk.Toplevel(self)
-        win.title("Recipe Run Progress")
-        win.geometry("520x260")
-        win.resizable(False, False)
+    def _show_run_tab(self):
+        """Create the Run tab if needed and bring it to the front."""
+        if self.run_tab is not None and self.run_tab.winfo_exists():
+            self.tabs.select(self.run_tab)
+            return
 
-        # If user closes the window, just hide it (run continues)
-        def _hide():
-            try:
-                win.withdraw()
-            except Exception:
-                pass
-        win.protocol("WM_DELETE_WINDOW", _hide)
+        tab = ttk.Frame(self.tabs, padding=10)
+        self.tabs.add(tab, text="Run")
+        self.run_tab = tab
 
-        self._run_progress_win = win
         self._run_progress_vars = {
+            "title": tk.StringVar(value="--"),
+            "queue": tk.StringVar(value=""),
+            "total": tk.StringVar(value="Total time (delay + recipe): --"),
+            "remaining": tk.StringVar(value="Remaining: --"),
+            "queue_total": tk.StringVar(value=""),
+            "queue_remaining": tk.StringVar(value=""),
             "pt": tk.StringVar(value="1. Waiting for PT1 to be < 20 hPa: --"),
-            "te1": tk.StringVar(value="2. Waiting for TE2/TE1 to be in range: --"),
-            "te210": tk.StringVar(value="3. Waiting for TE210/TE211 to be in range: --"),
+            "te1": tk.StringVar(value="2. Waiting for TE2 to be in range: --"),
+            "te210": tk.StringVar(value="3. Waiting for TE210 to be in range: --"),
             "delay": tk.StringVar(value="4. Delay before executing pulses: --"),
             "cycles": tk.StringVar(value="5. Cycles remaining: --"),
             "step": tk.StringVar(value="6. Current step: --"),
+            "result": tk.StringVar(value="Running"),
         }
+        v = self._run_progress_vars
 
-        frm = ttk.Frame(win, padding=10)
-        frm.pack(fill="both", expand=True)
+        # Header: recipe title, queue position, run result
+        head = ttk.Frame(tab)
+        head.pack(fill="x")
+        ttk.Label(head, textvariable=v["title"], font=("Arial", 14, "bold")).pack(side="left")
+        ttk.Label(head, textvariable=v["queue"], font=("Arial", 11)).pack(side="left", padx=15)
+        ttk.Label(head, textvariable=v["result"], font=("Arial", 11, "bold")).pack(side="right")
 
-        for k in ("pt","te1","te210","delay","cycles","step"):
-            ttk.Label(frm, textvariable=self._run_progress_vars[k]).pack(anchor="w", pady=2)
+        # Time: totals, remaining, estimated start/end, delay clock
+        times = ttk.LabelFrame(tab, text="Time")
+        times.pack(fill="x", pady=(10, 0))
+        left = ttk.Frame(times)
+        left.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        for k in ("total", "remaining", "queue_total", "queue_remaining"):
+            ttk.Label(left, textvariable=v[k]).pack(anchor="w")
+        ttk.Label(left, textvariable=self.run_timing_var).pack(anchor="w", pady=(4, 0))
+        ttk.Label(
+            left,
+            text="Times exclude pumpdown and warm-up, which cannot be known in advance.",
+            foreground="gray",
+        ).pack(anchor="w", pady=(4, 0))
 
-        ttk.Separator(frm).pack(fill="x", pady=(8, 6))
+        clock = ttk.Frame(times)
+        clock.pack(side="right", padx=15)
+        ttk.Label(clock, text="Delay").pack()
+        ttk.Label(clock, textvariable=self.delay_clock_var, font=("Courier New", 18, "bold"), foreground="red").pack()
 
-        btns = ttk.Frame(frm)
-        btns.pack(fill="x")
-        ttk.Button(btns, text="Hide", command=_hide).pack(side="right")
-        ttk.Label(btns, text="(Run continues even if hidden)", foreground="gray").pack(side="left")
+        # Progress: what the run is waiting on / doing
+        prog = ttk.LabelFrame(tab, text="Progress")
+        prog.pack(fill="x", pady=(10, 0))
+        for k in ("pt", "te1", "te210", "delay", "cycles", "step"):
+            ttk.Label(prog, textvariable=v[k]).pack(anchor="w", padx=8, pady=2)
 
-    def _close_run_progress_popup(self):
+        # Line indicators (green while a line is pulsing)
+        lines = ttk.LabelFrame(tab, text="Lines")
+        lines.pack(fill="x", pady=(10, 0))
+        self.line_indicator_frame = ttk.Frame(lines)
+        self.line_indicator_frame.pack(anchor="w", padx=8, pady=6)
+        self.line_indicators = {}
+
+        # Buttons
+        btns = ttk.Frame(tab)
+        btns.pack(fill="x", pady=(10, 0))
+        self.run_tab_abort_btn = ttk.Button(btns, text="Abort", command=self._abort_run)
+        self.run_tab_abort_btn.pack(side="left")
+        self.run_tab_dismiss_btn = ttk.Button(btns, text="Dismiss", command=self._close_run_tab)
+        self.run_tab_dismiss_btn.pack(side="right")
+        self.run_tab_dismiss_btn.state(["disabled"])
+
+        self.tabs.select(tab)
+
+    def _set_run_tab_recipe(self, recipe: dict):
+        """Fill the Run tab with the recipe that is starting (called for each recipe in a queue)."""
+        v = getattr(self, "_run_progress_vars", None)
+        if not v:
+            return
+        v["title"].set(self._get_recipe_title_for_logging(recipe))
+        v["result"].set("Running")
+        v["total"].set(f"Total time (delay + recipe): {self._seconds_to_hms(self._recipe_total_with_delay_s(recipe))}")
+
+        queue = getattr(self, "_queue_run_list", None) or []
+        if queue:
+            idx = int(getattr(self, "_queue_run_index", 0))
+            v["queue"].set(f"Queue: recipe {idx + 1} of {len(queue)}")
+            q_total = sum(self._recipe_total_with_delay_s(r) for r in queue)
+            v["queue_total"].set(f"Queue total time: {self._seconds_to_hms(q_total)}")
+        else:
+            v["queue"].set("")
+            v["queue_total"].set("")
+            v["queue_remaining"].set("")
+
+        self._rebuild_line_indicators(self._sorted_line_names(recipe))
+
         try:
-            if getattr(self, "_run_progress_win", None) and self._run_progress_win.winfo_exists():
-                self._run_progress_win.destroy()
+            self.tabs.tab(self.run_tab, text="Run")
+            self.run_tab_abort_btn.state(["!disabled"])
+            self.run_tab_dismiss_btn.state(["disabled"])
         except Exception:
             pass
-        self._run_progress_win = None
-        self._run_progress_vars = None
 
-    def _update_run_progress_popup(self, *, pt1=None, te2=None, te210=None, phase=None):
-        """Update popup strings from current run state/snapshot."""
+        self._update_run_tab()
+
+    def _close_run_tab(self):
+        """Remove the Run tab (on abort, Dismiss, or before a new run)."""
+        tab = getattr(self, "run_tab", None)
+        self.run_tab = None
+        self._run_progress_vars = None
+        self.line_indicator_frame = None
+        self.line_indicators = {}
+        if tab is not None:
+            try:
+                self.tabs.forget(tab)
+            except Exception:
+                pass
+            try:
+                tab.destroy()
+            except Exception:
+                pass
+
+    def _mark_run_tab_complete(self, message: str):
+        """Show a finished state on the Run tab. The tab stays until dismissed."""
+        v = getattr(self, "_run_progress_vars", None)
+        if not v:
+            return
+        v["result"].set("Complete")
+        v["remaining"].set("Remaining: 00:00:00")
+        if v["queue_total"].get():
+            v["queue_remaining"].set("Queue remaining: 00:00:00")
+        v["delay"].set("4. Delay before executing pulses: done")
+        v["cycles"].set("5. Cycles remaining: 0")
+        v["step"].set(f"6. Current step: {message}")
+        try:
+            self.tabs.tab(self.run_tab, text="Run (complete)")
+            self.run_tab_abort_btn.state(["disabled"])
+            self.run_tab_dismiss_btn.state(["!disabled"])
+        except Exception:
+            pass
+
+    def _run_remaining_s(self):
+        """Estimated seconds left in the current recipe, and whether the countdown has started."""
+        rs = self.run_state
+        if not rs:
+            return 0.0, True
+        recipe = rs.get("recipe", {}) or {}
+        try:
+            recipe_s = float(recipe.get("total_time_s", 0) or 0)
+        except Exception:
+            recipe_s = 0.0
+        phase = rs.get("phase")
+        if phase == "delay":
+            return max(0, int(rs.get("delay_remaining_s", 0) or 0)) + recipe_s, True
+        if phase in ("sequencing", "step_begin", "step_wait"):
+            started = rs.get("seq_started")
+            if started is None:
+                return recipe_s, True
+            return max(0.0, recipe_s - (time.time() - started)), True
+        # prechecks / pumpdown / warm-up: countdown has not started yet
+        return self._recipe_total_with_delay_s(recipe), False
+
+    def _update_run_tab(self, *, pt1=None, te2=None, te210=None, phase=None):
+        """Update Run tab text from current run state/snapshot."""
         if not getattr(self, "_run_progress_vars", None):
             return
         sp = {}
@@ -1997,6 +2130,16 @@ class PicoSimApp(tk.Tk):
             sp = self.run_state.get("recipe", {}).get("setpoints", {}) if self.run_state else {}
         except Exception:
             sp = {}
+
+        # Remaining time (this recipe, and the whole queue if one is running)
+        rem_s, counting = self._run_remaining_s()
+        note = "" if counting else "  (countdown starts after pumpdown and warm-up)"
+        self._run_progress_vars["remaining"].set(f"Remaining: {self._seconds_to_hms(rem_s)}{note}")
+        queue = getattr(self, "_queue_run_list", None) or []
+        if queue:
+            idx = int(getattr(self, "_queue_run_index", 0))
+            later = sum(self._recipe_total_with_delay_s(r) for r in queue[idx + 1:])
+            self._run_progress_vars["queue_remaining"].set(f"Queue remaining: {self._seconds_to_hms(rem_s + later)}")
 
         # 1) Pressure gate (Delay doesn't begin until PT1<20; same limit as the wait_stable check in _run_tick)
         if pt1 is None:
@@ -2054,12 +2197,12 @@ class PicoSimApp(tk.Tk):
             if line is None:
                 self._run_progress_vars["step"].set(f"6. Current step: block {blk+1}, step {si+1}")
             else:
-                self._run_progress_vars["step"].set(f"6. Current step: Line {line} — {action or '...'} (block {blk+1}, step {si+1})")
+                self._run_progress_vars["step"].set(f"6. Current step: Line {line}: {action or '...'} (block {blk+1}, step {si+1})")
         else:
             self._run_progress_vars["step"].set("6. Current step: --")
 
 
-    def _abort_run(self):
+    def _abort_run(self, reason=None):
         self.run_abort_flag = True
         if self.run_state is None:
             return
@@ -2068,9 +2211,14 @@ class PicoSimApp(tk.Tk):
         # Immediate: close line valves; leave V2 and V6 open; set temps to 20°C
         self._safe_state_abort()
         self.run_state = None
-        self.recipe_status.config(text="Aborted.")
-        self._close_run_progress_popup()
+        # Aborting ends the whole queue, so the next single run is not treated as part of it
+        self._queue_run_list = []
+        self._queue_run_active = False
+        self.recipe_status.config(text=f"Aborted: {reason}" if reason else "Aborted.")
+        self._close_run_tab()
         self.delay_clock_var.set("--:--")
+        msg = "Run Aborted" + (f"\n\n{reason}" if reason else "")
+        messagebox.showinfo("Run Aborted", msg, parent=self)
 
 
     def _set_pump_valves_by_pressure(self, pt_chamber_hpa: float):
@@ -2136,16 +2284,14 @@ class PicoSimApp(tk.Tk):
         te2 = float(self.snapshot_data.get("TE2", -999.0)) if getattr(self, "snapshot_data", None) else -999.0
         te210 = float(self.snapshot_data.get("TE210", -999.0)) if getattr(self, "snapshot_data", None) else -999.0
 
-        # Update run-progress popup
+        # Update Run tab
         try:
-            self._update_run_progress_popup(pt1=pt1, te2=te2, te210=te210, phase=phase)
+            self._update_run_tab(pt1=pt1, te2=te2, te210=te210, phase=phase)
         except Exception:
             pass
         # PT safety during pulsing
         if phase in ("sequencing", "step_pulse", "step_purge", "step_sf") and pt1 > 20.0:
-            self.recipe_status.config(text=f"ERROR: PT1 rose above 20 hPa (PT1={pt1:.1f}). Halting pulsing.")
-            self._safe_state_abort()
-            self.run_state = None
+            self._abort_run(reason=f"ERROR: PT1 rose above 20 hPa (PT1={pt1:.1f}). Halting pulsing.")
             return
 
         # Lid closed check (inferred)
@@ -2172,6 +2318,10 @@ class PicoSimApp(tk.Tk):
                 else:
                     self.recipe_status.config(text="Run cancelled (lid open).")
                     self.run_state = None
+                    self._queue_run_list = []
+                    self._queue_run_active = False
+                    self._stop_run_hires_capture()
+                    self._close_run_tab()
                     return
 
             # OK: apply flows
@@ -2219,7 +2369,7 @@ class PicoSimApp(tk.Tk):
                 total = recipe.get("total_time_s", 0.0)
                 delay_s = self.run_state["delay_remaining_s"]
                 end_time = start_time + timedelta(seconds=(delay_s + total))
-                self.run_timing_var.set(f"Start: {start_time.strftime('%H:%M:%S')}   End: {end_time.strftime('%H:%M:%S')}")
+                self.run_timing_var.set(f"Est. start: {start_time.strftime('%H:%M:%S')}   Est. end: {end_time.strftime('%H:%M:%S')}")
                 self.after(200, self._run_tick)
                 return
 
@@ -2233,6 +2383,7 @@ class PicoSimApp(tk.Tk):
             if rem <= 0:
                 self.delay_clock_var.set("00:00")
                 self.run_state["phase"] = "sequencing"
+                self.run_state["seq_started"] = time.time()
                 self.recipe_status.config(text="Executing recipe...")
                 self.run_state["current_block"] = 0
                 self.run_state["current_cycle"] = 0
@@ -2355,30 +2506,6 @@ class PicoSimApp(tk.Tk):
         self.recipe_status.config(text="Run complete. Setting post-deposition temperature...")
         # (hi-res capture stopped at end of run / end of queue)
 
-        # --- NEW: ensure popup shows a clean terminal state ---
-        if self.run_state is None:
-            self.run_state = {}  # defensive; should not happen, but avoids key errors below
-
-        # Clear any stale "current step" info so the popup doesn't keep showing "purge"
-        self.run_state["current_line"] = None
-        self.run_state["current_action"] = None
-        self.run_state["phase"] = "complete"
-        self.run_state["cycle_left_in_block"] = 0
-        self.run_state["current_block"] = self.run_state.get("current_block", 0)
-        self.run_state["current_step"] = self.run_state.get("current_step", 0)
-
-        # If you have the popup open, push a final message into it
-        try:
-            self._update_run_progress_popup(
-                f"Post-recipe setpoints engaged, recipe complete",
-                f"Delay before executing pulses: done",
-                f"Cycles remaining (block {self.run_state.get('current_block', 0)+1}): 0",
-                f"Post-recipe setpoints engaged, recipe complete"
-            )
-        except Exception:
-            pass
-        # --- END NEW ---
-
         try:
             post_c = float(recipe["setpoints"]["post_TE2"])
             post_raw = int(round(post_c * 10.0))
@@ -2397,17 +2524,6 @@ class PicoSimApp(tk.Tk):
 
 
 
-        # --- NEW: close out run state AFTER final popup update ---
-        # Force the progress popup to show a clean terminal state (no more ticks after run_state=None)
-        try:
-            if hasattr(self, "_run_progress_vars") and self._run_progress_vars:
-                # These keys should match what you set when creating the popup
-                self._run_progress_vars["delay"].set("4. Delay before executing pulses: done")
-                self._run_progress_vars["cycles"].set("5. Cycles remaining: 0")
-                self._run_progress_vars["step"].set("6. Current step: Post-recipe setpoints engaged, recipe complete")
-        except Exception:
-            pass
-
         # Optional: make the main status match
         self.recipe_status.config(text="Post-recipe setpoints engaged, recipe complete")
 
@@ -2424,11 +2540,16 @@ class PicoSimApp(tk.Tk):
             self._queue_run_index += 1
             if self._queue_run_index < len(self._queue_run_list):
                 self._start_run(self._queue_run_list[self._queue_run_index])
-            else:
-                self._queue_run_list = []
-                self._stop_run_hires_capture()
-                self._queue_run_active = False
-                self.recipe_status.config(text="Queue complete.")
+                return
+            # Queue finished: keep the queue list until the Run tab shows its final state
+            self._mark_run_tab_complete("Post-recipe setpoints engaged, queue complete")
+            self._queue_run_list = []
+            self._stop_run_hires_capture()
+            self._queue_run_active = False
+            self.recipe_status.config(text="Queue complete.")
+            return
+
+        self._mark_run_tab_complete("Post-recipe setpoints engaged, recipe complete")
     def _close_all_line_valves(self):
         for v in ("V110", "V210", "V211", "V310", "V420", "V422"):
             self._toggle_valve(v, False)
